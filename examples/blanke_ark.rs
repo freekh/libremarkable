@@ -1,10 +1,10 @@
 mod blanke_ark_lib;
 
-use std::sync::mpsc::{self, channel};
-use std::thread::spawn;
+use std::sync::mpsc::channel;
 
 use blanke_ark_lib::message::{ChunkCoordinates, GlobalCoordinates, Path, Subscription};
-use evdev::InputEvent;
+use futures::stream::StreamExt;
+use futures::SinkExt;
 use libremarkable::framebuffer::common::{
     display_temp, dither_mode, waveform_mode, DRAWING_QUANT_BIT,
 };
@@ -12,40 +12,82 @@ use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferDraw, FramebufferRefresh, PartialRefreshMode};
 use libremarkable::input::ev::EvDevContext;
 use libremarkable::input::WacomEvent;
-use libremarkable::{appctx, battery, image, input};
-use tungstenite::{connect, Message};
+use libremarkable::{appctx, input};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
     let mut app: appctx::ApplicationContext<'_> = appctx::ApplicationContext::default();
 
     app.clear(true);
 
-    let (mut socket, response) = connect("wss://ark.blank.no/ws").expect("Can't connect");
-
+    let (ws_stream, _) = connect_async("wss://ark.blank.no/ws")
+        .await
+        .expect("Failed to connect");
+    let (mut write, mut read) = ws_stream.split();
     println!("Connected to the server");
-    // println!("Response HTTP code: {}", response.status());
-    // println!("Response contains the following headers:");
-    // for (ref header, _value) in response.headers() {
-    //     println!("* {}", header);
-    // }
     println!("{:?}", app.get_dimensions());
     let chunk_size = 1404f32;
+    let framebuffer = app.get_framebuffer_ref();
 
-    socket
+    tokio::spawn(async move {
+        println!("Listening for messages");
+        while let Some(msg) = read.next().await {
+            println!("{:?}", msg);
+            if let Ok(Message::Binary(data)) = msg {
+                let message: blanke_ark_lib::message::Message =
+                    postcard::from_bytes(&data).unwrap();
+                match message {
+                    blanke_ark_lib::message::Message::Draw(draw_message) => {
+                        match draw_message {
+                            blanke_ark_lib::message::DrawMessage::Path(path) => {
+                                draw_path(path, chunk_size, framebuffer);
+                                refresh(framebuffer);
+                            }
+                            blanke_ark_lib::message::DrawMessage::Composite(composite) => {
+                                composite.0.iter().for_each(|msg| {
+                            match msg {
+                                blanke_ark_lib::message::DrawMessage::Path(path) => {
+                                    draw_path(path.clone(), chunk_size, framebuffer);
+                                }
+                                _ => {
+                                    println!("Received composite draw message that is not a path");
+                                    return;
+                                }
+                            };
+                        });
+                                refresh(framebuffer);
+                            }
+                            _ => {
+                                println!(
+                                    "Received draw message that is not a path: {:?}",
+                                    draw_message
+                                );
+                            }
+                        }
+                    }
+                    blanke_ark_lib::message::Message::Subscribe(subscription) => {
+                        println!("Received subscription: {:?}!!?!?!", subscription);
+                    }
+                }
+            }
+        }
+        println!("Out for messages");
+    });
+
+    write
         .send(Message::Binary(
             postcard::to_allocvec(&blanke_ark_lib::message::Message::Subscribe(
                 Subscription::from(ChunkCoordinates { x: 0, y: 0 }),
             ))
             .unwrap(),
         ))
+        .await
         .unwrap();
-    let framebuffer = app.get_framebuffer_ref();
 
-    let (input_sender, input_receiver) = mpsc::sync_channel(1000);
-
-    // input thread:
-    spawn(move || {
+    tokio::spawn(async move {
         let (input_tx, input_rx) = channel::<input::InputEvent>();
         EvDevContext::new(input::InputDevice::Wacom, input_tx).start();
         loop {
@@ -78,7 +120,7 @@ fn main() {
                                 ))
                                 .unwrap(),
                             );
-                            input_sender.send(msg).unwrap();
+                            write.send(msg).await.unwrap();
                         }
                         _ => {
                             // println!(
@@ -94,49 +136,6 @@ fn main() {
             }
         }
     });
-
-    loop {
-        let msg = socket.read();
-        println!("{:?}", msg);
-        if let Ok(Message::Binary(data)) = msg {
-            let message: blanke_ark_lib::message::Message = postcard::from_bytes(&data).unwrap();
-            match message {
-                blanke_ark_lib::message::Message::Draw(draw_message) => match draw_message {
-                    blanke_ark_lib::message::DrawMessage::Path(path) => {
-                        draw_path(path, chunk_size, framebuffer);
-                        refresh(framebuffer);
-                    }
-                    blanke_ark_lib::message::DrawMessage::Composite(composite) => {
-                        composite.0.iter().for_each(|msg| {
-                            match msg {
-                                blanke_ark_lib::message::DrawMessage::Path(path) => {
-                                    draw_path(path.clone(), chunk_size, framebuffer);
-                                }
-                                _ => {
-                                    println!("Received composite draw message that is not a path");
-                                    return;
-                                }
-                            };
-                        });
-                        refresh(framebuffer);
-                    }
-                    _ => {
-                        println!(
-                            "Received draw message that is not a path: {:?}",
-                            draw_message
-                        );
-                    }
-                },
-                blanke_ark_lib::message::Message::Subscribe(subscription) => {
-                    println!("Received subscription: {:?}!!?!?!", subscription);
-                }
-            }
-        }
-        input_receiver.try_recv().into_iter().for_each(|msg| {
-            socket.send(msg).unwrap();
-        });
-    }
-    // socket.close(None)
 }
 
 fn draw_path(path: Path, chunk_size: f32, framebuffer: &mut Framebuffer) {

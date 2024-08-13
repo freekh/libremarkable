@@ -21,6 +21,14 @@ deploy-x-demo: x-demo
 	scp ./target/$(TARGET)/release/examples/demo $(DEVICE_HOST):
 	ssh $(DEVICE_HOST) 'RUST_BACKTRACE=1 RUST_LOG=debug ./demo'
 
+x-ba:
+	cross build --example blanke_ark --release --target=$(TARGET)
+deploy-x-ba: x-ba
+	du -sh ./target/$(TARGET)/release/examples/blanke_ark
+	ssh $(DEVICE_HOST) 'killall -q -9 blanke_ark || true; systemctl stop xochitl || true'
+	rsync  --progress -z ./target/$(TARGET)/release/examples/blanke_ark $(DEVICE_HOST):
+	ssh $(DEVICE_HOST) 'RUST_BACKTRACE=1 RUST_LOG=debug ./blanke_ark'
+
 bench:
 	cargo build --examples --release --target=armv7-unknown-linux-gnueabihf --features "enable-runtime-benchmarking"
 

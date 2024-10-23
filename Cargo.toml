@@ -41,7 +41,6 @@ hlua = { version = "0.4.1", optional = true }
 # runtime benchmarking
 stopwatch = { version = "0.0.7", optional = true }
 futures = "0.3.30"
-ulid = { version = "1.1.2", features = ["serde"] }
 
 [features]
 default = ["scan", "framebuffer-types", "framebuffer", "framebuffer-storage", "framebuffer-drawing", "image", "framebuffer-text-drawing", "input-types", "input", "battery", "appctx", "hlua"]
@@ -98,3 +97,4 @@ tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "net", "s
 tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
 serde = { version= "1.0" }
 postcard = { version = "1.0", features = ["alloc"] }
+ulid = { version = "1.1.2", features = ["serde"] }

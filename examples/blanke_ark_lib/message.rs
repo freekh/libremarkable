@@ -5,6 +5,8 @@ use std::{
     fmt::{Debug, Display},
 };
 
+use ulid::Ulid;
+
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy, Deserialize, Serialize)]
 pub struct ChunkCoordinates {
     pub x: i32,
@@ -72,21 +74,30 @@ impl Color {
 }
 
 #[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct Width(f64);
+pub struct Width(f32);
 
-impl From<f64> for Width {
-    fn from(value: f64) -> Self {
+impl From<f32> for Width {
+    fn from(value: f32) -> Self {
         Self(value)
     }
 }
 
 impl Width {
-    pub fn new(v: f64) -> Self {
+    pub fn new(v: f32) -> Self {
         Self(v)
     }
 
-    pub fn as_f64(&self) -> f64 {
+    pub fn as_f32(&self) -> f32 {
         self.0
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize, Eq, Hash)]
+pub struct PathId(Ulid);
+
+impl From<Ulid> for PathId {
+    fn from(value: Ulid) -> Self {
+        Self(value)
     }
 }
 
@@ -105,6 +116,25 @@ impl Path {
             color,
         }
     }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum PathStepAction {
+    Draw(PathStepDraw),
+    End(PathStepEnd),
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PathStepDraw {
+    pub id: PathId,
+    pub point: GlobalCoordinates,
+    pub width: Width,
+    pub color: Color,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PathStepEnd {
+    pub id: PathId,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
@@ -216,6 +246,7 @@ impl<T: Into<DrawMessage>> From<T> for Message {
 pub enum DrawMessage {
     Composite(CompositeDrawMessage),
     Path(Path),
+    PathStepAction(PathStepAction),
     Line(Line),
     Dot(Dot),
 }

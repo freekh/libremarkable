@@ -3,7 +3,8 @@ mod blanke_ark_lib;
 use std::sync::Arc;
 
 use blanke_ark_lib::message::{
-    ChunkCoordinates, GlobalCoordinates, Line, Path, PathId, PathStepAction, Subscription,
+    ChunkCoordinates, GlobalCoordinates, Line, Path, PathId, PathStepAction, PathStepDraw,
+    PathStepEnd, Subscription,
 };
 use cgmath::Point2;
 use futures::stream::StreamExt;
@@ -187,7 +188,7 @@ async fn main_blanke_ark() {
             >,
         >,
     > = Arc::new(Mutex::new(write));
-    let mut last_point: Option<Point2<i32>> = None;
+    let mut last_path_id: Option<PathId> = None;
     app.start_event_loop(true, true, true, |_ctx, evt| match evt {
         input::InputEvent::WacomEvent { event } => match event {
             WacomEvent::Draw {
@@ -199,32 +200,47 @@ async fn main_blanke_ark() {
                     x: position.x as i32,
                     y: position.y as i32,
                 };
-                if let Some(last_point) = last_point {
-                    println!("Drawing line from {:?} to {:?}", last_point, current_point);
-                    let line = blanke_ark_lib::message::Message::Draw(
-                        blanke_ark_lib::message::DrawMessage::Line(Line {
-                            from: GlobalCoordinates {
-                                x: last_point.x as f32 / chunk_size,
-                                y: last_point.y as f32 / chunk_size,
-                            },
-                            to: GlobalCoordinates {
-                                x: current_point.x as f32 / chunk_size,
-                                y: current_point.y as f32 / chunk_size,
-                            },
-                            color: blanke_ark_lib::message::Color::new_rgb(0, 0, 0),
-                            width: blanke_ark_lib::message::Width::new(2.0),
-                        }),
+                if let Some(last_path_id) = last_path_id {
+                    println!(
+                        "Drawing point {:?} on path {:?} ",
+                        current_point, last_path_id
                     );
-                    let msg = Message::Binary(postcard::to_allocvec(&line).unwrap());
+                    let msg = &blanke_ark_lib::message::Message::Draw(
+                        blanke_ark_lib::message::DrawMessage::PathStepAction(
+                            blanke_ark_lib::message::PathStepAction::Draw(PathStepDraw {
+                                point: GlobalCoordinates {
+                                    x: (position.x as f32 / chunk_size),
+                                    y: (position.y as f32 / chunk_size),
+                                },
+                                color: blanke_ark_lib::message::Color::new_rgb(0, 0, 0),
+                                width: blanke_ark_lib::message::Width::new(2.0),
+                                id: last_path_id,
+                            }),
+                        ),
+                    );
+                    let binary_msg = Message::Binary(postcard::to_allocvec(&msg).unwrap());
                     let write = write.clone();
                     tokio::spawn(async move {
-                        write.lock().await.send(msg).await.unwrap();
+                        write.lock().await.send(binary_msg).await.unwrap();
                     });
                 }
-                last_point = Some(current_point);
             }
             _ => {
-                last_point = None;
+                if let Some(last_path_id) = last_path_id {
+                    let msg = &blanke_ark_lib::message::Message::Draw(
+                        blanke_ark_lib::message::DrawMessage::PathStepAction(
+                            blanke_ark_lib::message::PathStepAction::End(PathStepEnd {
+                                id: last_path_id,
+                            }),
+                        ),
+                    );
+                    let binary_msg = Message::Binary(postcard::to_allocvec(&msg).unwrap());
+                    let write = write.clone();
+                    tokio::spawn(async move {
+                        write.lock().await.send(binary_msg).await.unwrap();
+                    });
+                }
+                last_path_id = Some(PathId::from(ulid::Ulid::new()));
             }
         },
         _ => {}

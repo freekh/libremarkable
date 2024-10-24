@@ -1,8 +1,11 @@
 mod blanke_ark_lib;
 
-use std::sync::mpsc::channel;
+use std::sync::Arc;
 
-use blanke_ark_lib::message::{ChunkCoordinates, GlobalCoordinates, Path, PathId, PathStepAction, PathStepDraw, Subscription};
+use blanke_ark_lib::message::{
+    ChunkCoordinates, GlobalCoordinates, Line, Path, PathId, PathStepAction, Subscription,
+};
+use cgmath::Point2;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use libremarkable::framebuffer::common::{
@@ -10,21 +13,72 @@ use libremarkable::framebuffer::common::{
 };
 use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferDraw, FramebufferRefresh, PartialRefreshMode};
-use libremarkable::input::ev::EvDevContext;
-use libremarkable::input::{InputEvent, WacomEvent};
+use libremarkable::input::WacomEvent;
 use libremarkable::{appctx, input};
-use ulid::Ulid;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[tokio::main]
 async fn main() {
+    // main_simple().await;
+    main_blanke_ark().await;
+}
+
+async fn main_simple() {
     env_logger::init();
     let mut app: appctx::ApplicationContext<'_> = appctx::ApplicationContext::default();
-
     app.clear(true);
+    let framebuffer = app.get_framebuffer_ref();
+
+    let mut last_point: Option<Point2<i32>> = None;
+    app.start_event_loop(true, true, true, |_ctx, evt| match evt {
+        input::InputEvent::WacomEvent { event } => match event {
+            WacomEvent::Draw {
+                position,
+                pressure: _,
+                tilt: _,
+            } => {
+                let current_point = Point2 {
+                    x: position.x as i32,
+                    y: position.y as i32,
+                };
+                if let Some(last_point) = last_point {
+                    println!("Drawing line from {:?} to {:?}", last_point, current_point);
+                    let region = framebuffer.draw_line(
+                        last_point,
+                        current_point,
+                        2,
+                        libremarkable::framebuffer::common::color::BLACK,
+                    );
+                    framebuffer.partial_refresh(
+                        &region,
+                        PartialRefreshMode::Async,
+                        // DU mode only supports black and white colors.
+                        // See the documentation of the different waveform modes
+                        // for more information
+                        waveform_mode::WAVEFORM_MODE_DU,
+                        display_temp::TEMP_USE_REMARKABLE_DRAW,
+                        dither_mode::EPDC_FLAG_EXP1,
+                        DRAWING_QUANT_BIT,
+                        false,
+                    );
+                }
+                last_point = Some(current_point);
+            }
+            _ => {
+                last_point = None;
+            }
+        },
+        _ => {}
+    })
+}
+
+async fn main_blanke_ark() {
+    env_logger::init();
+    let mut app: appctx::ApplicationContext<'_> = appctx::ApplicationContext::default();
+    app.clear(true);
+    let framebuffer = app.get_framebuffer_ref();
 
     let (ws_stream, _) = connect_async("wss://ark.blank.no/ws")
         .await
@@ -33,31 +87,28 @@ async fn main() {
     println!("Connected to the server");
     println!("{:?}", app.get_dimensions());
     let chunk_size = 1404f32;
-    let framebuffer = app.get_framebuffer_ref();
-    
-    let mut last_step_coords: Option<GlobalCoordinates> = None;
+    let mut maybe_last_step_coords: Option<GlobalCoordinates> = None;
+    let mut maybe_last_step_id: Option<PathId> = None;
     tokio::spawn(async move {
         println!("Listening for messages");
         while let Some(msg) = read.next().await {
-            println!("{:?}", msg);
             if let Ok(Message::Binary(data)) = msg {
                 let message: blanke_ark_lib::message::Message =
                     postcard::from_bytes(&data).unwrap();
                 match message {
-                    blanke_ark_lib::message::Message::Draw(draw_message) => {
-                        match draw_message {
-                            blanke_ark_lib::message::DrawMessage::Path(path) => {
-                                draw_path(path, chunk_size, framebuffer);
-                                refresh(framebuffer);
-                            }
-                            blanke_ark_lib::message::DrawMessage::Composite(composite) => {
-                                composite.0.iter().for_each(|msg| {
+                    blanke_ark_lib::message::Message::Draw(draw_message) => match draw_message {
+                        blanke_ark_lib::message::DrawMessage::Path(path) => {
+                            draw_path(path, chunk_size, framebuffer);
+                            refresh(framebuffer);
+                        }
+                        blanke_ark_lib::message::DrawMessage::Composite(composite) => {
+                            composite.0.iter().for_each(|msg| {
                             match msg {
                                 blanke_ark_lib::message::DrawMessage::Path(path) => {
                                     draw_path(path.clone(), chunk_size, framebuffer);
                                 }
                                 blanke_ark_lib::message::DrawMessage::Line(line) => {
-                                    draw_line(line.clone(), chunk_size, framebuffer);
+                                    draw_line(line.from,  line.to, line.width.as_f32(), chunk_size, framebuffer);
                                 }
                                 _ => {
                                     println!("Received composite draw message that is not a path: {:?}", msg);
@@ -65,49 +116,49 @@ async fn main() {
                                 }
                             };
                         });
-                                refresh(framebuffer);
-                            }
-                            blanke_ark_lib::message::DrawMessage::PathStepAction(step_action) => {
-                                match step_action {
-                                    PathStepAction::Draw(step_draw) => {
-                                       match last_step_coords {
-                                            Some(lsc) => {
-                                                println!("Drawing line from {:?} to {:?}", lsc, step_draw.point);
-                                                framebuffer.draw_line(
-                                                    cgmath::Point2 {
-                                                        x: (lsc.x * chunk_size) as i32,
-                                                        y: (lsc.y * chunk_size) as i32,
-                                                    },
-                                                    cgmath::Point2 {
-                                                        x: (step_draw.point.x * chunk_size) as i32,
-                                                        y: (step_draw.point.y * chunk_size) as i32,
-                                                    },
-                                                    step_draw.width.as_f32() as u32,
-                                                    libremarkable::framebuffer::common::color::BLACK,
+                            refresh(framebuffer);
+                        }
+                        blanke_ark_lib::message::DrawMessage::PathStepAction(step_action) => {
+                            match step_action {
+                                PathStepAction::Draw(step_draw) => {
+                                    if let Some(last_step_coords) = maybe_last_step_coords {
+                                        if let Some(last_step_id) = maybe_last_step_id {
+                                            if last_step_id == step_draw.id {
+                                                draw_line(
+                                                    last_step_coords,
+                                                    step_draw.point.clone(),
+                                                    step_draw.width.as_f32(),
+                                                    chunk_size,
+                                                    framebuffer,
                                                 );
                                             }
-                                            None => {
-                                                println!("skip")
-                                                // do nothing
-                                            }
-                                       }
-                                       last_step_coords = Some(step_draw.point.clone());
+                                        }
                                     }
-                                    _ => {
-                                        println!("step action that is not a draw: {:?}", step_action);
-                                        return;
-                                    }
-                                };
-                                // println!("Received composite draw message that is not a path: {:?}", msg);
-                            }
-                            _ => {
-                                println!(
-                                    "Received draw message that is not a path: {:?}",
-                                    draw_message
-                                );
-                            }
+                                    maybe_last_step_id = Some(step_draw.id);
+                                    maybe_last_step_coords = Some(step_draw.point.clone());
+                                }
+                                _ => {
+                                    println!(
+                                        "Received step action that is not a draw: {:?}",
+                                        step_action
+                                    );
+                                    return;
+                                }
+                            };
                         }
-                    }
+                        blanke_ark_lib::message::DrawMessage::Line(line) => {
+                            draw_line(
+                                line.from,
+                                line.to,
+                                line.width.as_f32(),
+                                chunk_size,
+                                framebuffer,
+                            );
+                        }
+                        _ => {
+                            println!("Unhandled draw message: {:?}", draw_message);
+                        }
+                    },
                     blanke_ark_lib::message::Message::Subscribe(subscription) => {
                         println!("Received subscription: {:?}!!?!?!", subscription);
                     }
@@ -116,7 +167,6 @@ async fn main() {
         }
         println!("Out for messages");
     });
-
     write
         .send(Message::Binary(
             postcard::to_allocvec(&blanke_ark_lib::message::Message::Subscribe(
@@ -127,104 +177,54 @@ async fn main() {
         .await
         .unwrap();
 
-    // tokio::spawn(async move {
-    //     let (input_tx, input_rx) = channel::<input::InputEvent>();
-    //     EvDevContext::new(input::InputDevice::Wacom, input_tx).start();
-    //     loop {
-    //         if let Ok(event) = input_rx.recv() {
-    //             match event {
-    //                 input::InputEvent::WacomEvent { event } => match event {
-    //                     WacomEvent::Draw {
-    //                         position,
-    //                         pressure,
-    //                         tilt: _,
-    //                     } => {
-    //                         let msg = Message::Binary(
-    //                             postcard::to_allocvec(&blanke_ark_lib::message::Message::Draw(
-    //                                 blanke_ark_lib::message::DrawMessage::Dot(
-    //                                     blanke_ark_lib::message::Dot {
-    //                                         coordinates: GlobalCoordinates {
-    //                                             x: (position.x / chunk_size),
-    //                                             y: (position.y / chunk_size),
-    //                                         },
-    //                                         diam: blanke_ark_lib::message::Width::from(
-    //                                             pressure as f32,
-    //                                         ),
-    //                                         color: blanke_ark_lib::message::Color::RGB {
-    //                                             r: 0,
-    //                                             g: 0,
-    //                                             b: 0,
-    //                                         },
-    //                                     },
-    //                                 ),
-    //                             ))
-    //                             .unwrap(),
-    //                         );
-    //                         write.send(msg).await.unwrap();
-    //                     }
-    //                     _ => {
-    //                         // println!(
-    //                         //     "Received input event that is not a wacom event: {:?}",
-    //                         //     event
-    //                         // );
-    //                     }
-    //                 },
-    //                 _ => {
-    //                     // println!("Received input event that is not a wacom event");
-    //                 }
-    //             }
-    //         }
-    //     }
-    // });
-
-    let write = Arc::new(Mutex::new(write));
-    let id = Ulid::new();
+    let write: Arc<
+        Mutex<
+            futures::stream::SplitSink<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                Message,
+            >,
+        >,
+    > = Arc::new(Mutex::new(write));
+    let mut last_point: Option<Point2<i32>> = None;
     app.start_event_loop(true, true, true, |_ctx, evt| match evt {
         input::InputEvent::WacomEvent { event } => match event {
             WacomEvent::Draw {
                 position,
-                pressure,
+                pressure: _,
                 tilt: _,
             } => {
-                println!("Position: {:?}", position);
-                let msg = Message::Binary(
-                    postcard::to_allocvec(&blanke_ark_lib::message::Message::Draw(
-                        blanke_ark_lib::message::DrawMessage::PathStepAction(blanke_ark_lib::message::PathStepAction::Draw(
-                            PathStepDraw {
-                                point: GlobalCoordinates {
-                                    x: (position.x / chunk_size),
-                                    y: (position.y / chunk_size),
-                                },
-                                color: blanke_ark_lib::message::Color::RGB {
-                                    r: 0,
-                                    g: 0,
-                                    b: 0,
-                                },
-                                width: blanke_ark_lib::message::Width::from(pressure as f32),
-                                id: PathId::from(id),
+                let current_point = Point2 {
+                    x: position.x as i32,
+                    y: position.y as i32,
+                };
+                if let Some(last_point) = last_point {
+                    println!("Drawing line from {:?} to {:?}", last_point, current_point);
+                    let line = blanke_ark_lib::message::Message::Draw(
+                        blanke_ark_lib::message::DrawMessage::Line(Line {
+                            from: GlobalCoordinates {
+                                x: last_point.x as f32 / chunk_size,
+                                y: last_point.y as f32 / chunk_size,
                             },
-                        ),
-                    )))
-                    .unwrap(),
-                );
-                println!(
-                    "Sending message: {:?}",
-                    postcard::from_bytes::<blanke_ark_lib::message::Message>(
-                        &msg.clone().into_data()
-                    )
-                );
-
-                let write_clone = Arc::clone(&write); // Clone the Arc
-                tokio::spawn(async move {
-                    let mut write_lock = write_clone.lock().await; // Async lock the tokio::sync::Mutex
-                    write_lock.send(msg).await.unwrap(); // Now you can await safely
-                });
+                            to: GlobalCoordinates {
+                                x: current_point.x as f32 / chunk_size,
+                                y: current_point.y as f32 / chunk_size,
+                            },
+                            color: blanke_ark_lib::message::Color::new_rgb(0, 0, 0),
+                            width: blanke_ark_lib::message::Width::new(2.0),
+                        }),
+                    );
+                    let msg = Message::Binary(postcard::to_allocvec(&line).unwrap());
+                    let write = write.clone();
+                    tokio::spawn(async move {
+                        write.lock().await.send(msg).await.unwrap();
+                    });
+                }
+                last_point = Some(current_point);
             }
             _ => {
-                // println!(
-                //     "Received input event that is not a wacom event: {:?}",
-                //     event
-                // );
+                last_point = None;
             }
         },
         _ => {}
@@ -233,7 +233,7 @@ async fn main() {
 
 fn draw_path(path: Path, chunk_size: f32, framebuffer: &mut Framebuffer) {
     path.points.windows(2).for_each(|segment| {
-        let start = cgmath::Point2 {
+        let start = Point2 {
             x: (segment[0].x * chunk_size) as i32,
             y: (segment[0].y * chunk_size) as i32,
         };
@@ -250,19 +250,36 @@ fn draw_path(path: Path, chunk_size: f32, framebuffer: &mut Framebuffer) {
     });
 }
 
-fn draw_line(line: blanke_ark_lib::message::Line, chunk_size: f32, framebuffer: &mut Framebuffer) {
-    println!("Drawing line from {:?} to {:?}", line.from, line.to);
-    framebuffer.draw_line(
+fn draw_line(
+    from: blanke_ark_lib::message::GlobalCoordinates,
+    to: blanke_ark_lib::message::GlobalCoordinates,
+    width: f32,
+    chunk_size: f32,
+    framebuffer: &mut Framebuffer,
+) {
+    let region = framebuffer.draw_line(
         cgmath::Point2 {
-            x: (line.from.x * chunk_size) as i32,
-            y: (line.from.y * chunk_size) as i32,
+            x: (from.x * chunk_size) as i32,
+            y: (from.y * chunk_size) as i32,
         },
         cgmath::Point2 {
-            x: (line.to.x * chunk_size) as i32,
-            y: (line.to.y * chunk_size) as i32,
+            x: (to.x * chunk_size) as i32,
+            y: (to.y * chunk_size) as i32,
         },
-        1,
+        width as u32,
         libremarkable::framebuffer::common::color::BLACK,
+    );
+    framebuffer.partial_refresh(
+        &region,
+        PartialRefreshMode::Async,
+        // DU mode only supports black and white colors.
+        // See the documentation of the different waveform modes
+        // for more information
+        waveform_mode::WAVEFORM_MODE_DU,
+        display_temp::TEMP_USE_REMARKABLE_DRAW,
+        dither_mode::EPDC_FLAG_EXP1,
+        DRAWING_QUANT_BIT,
+        false,
     );
 }
 

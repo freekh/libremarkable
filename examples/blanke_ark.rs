@@ -40,15 +40,15 @@ async fn main_simple() {
                 pressure: _,
                 tilt: _,
             } => {
-                let current_point = Point2 {
+                let end = Point2 {
                     x: position.x as i32,
                     y: position.y as i32,
                 };
-                if let Some(last_point) = last_point {
-                    println!("Drawing line from {:?} to {:?}", last_point, current_point);
+                if let Some(start) = last_point {
+                    println!("Drawing line from {:?} to {:?}", start, end);
                     let region = framebuffer.draw_line(
-                        last_point,
-                        current_point,
+                        start,
+                        end,
                         2,
                         libremarkable::framebuffer::common::color::BLACK,
                     );
@@ -65,7 +65,7 @@ async fn main_simple() {
                         false,
                     );
                 }
-                last_point = Some(current_point);
+                last_point = Some(end);
             }
             _ => {
                 last_point = None;
@@ -188,51 +188,59 @@ async fn main_blanke_ark() {
             >,
         >,
     > = Arc::new(Mutex::new(write));
-    let mut last_path_id: Option<PathId> = None;
-    app.start_event_loop(true, true, true, |_ctx, evt| match evt {
+    let mut points: Vec<GlobalCoordinates> = Vec::new();
+    let mut last_framebuffer_point: Option<Point2<i32>> = None;
+    app.start_event_loop(true, true, true, |ctx, evt| match evt {
         input::InputEvent::WacomEvent { event } => match event {
             WacomEvent::Draw {
                 position,
                 pressure: _,
                 tilt: _,
             } => {
-                let current_point = Point2 {
+                let framebuffer = ctx.get_framebuffer_ref();
+                let end = Point2 {
                     x: position.x as i32,
                     y: position.y as i32,
                 };
-                if let Some(last_path_id) = last_path_id {
-                    println!(
-                        "Drawing point {:?} on path {:?} ",
-                        current_point, last_path_id
+                if let Some(start) = last_framebuffer_point {
+                    println!("Drawing line from {:?} to {:?}", start, end);
+                    let region = framebuffer.draw_line(
+                        start,
+                        end,
+                        2,
+                        libremarkable::framebuffer::common::color::BLACK,
                     );
-                    let msg = &blanke_ark_lib::message::Message::Draw(
-                        blanke_ark_lib::message::DrawMessage::PathStepAction(
-                            blanke_ark_lib::message::PathStepAction::Draw(PathStepDraw {
-                                point: GlobalCoordinates {
-                                    x: (position.x as f32 / chunk_size),
-                                    y: (position.y as f32 / chunk_size),
-                                },
-                                color: blanke_ark_lib::message::Color::new_rgb(0, 0, 0),
-                                width: blanke_ark_lib::message::Width::new(2.0),
-                                id: last_path_id,
-                            }),
-                        ),
+                    framebuffer.partial_refresh(
+                        &region,
+                        PartialRefreshMode::Async,
+                        // DU mode only supports black and white colors.
+                        // See the documentation of the different waveform modes
+                        // for more information
+                        waveform_mode::WAVEFORM_MODE_DU,
+                        display_temp::TEMP_USE_REMARKABLE_DRAW,
+                        dither_mode::EPDC_FLAG_EXP1,
+                        DRAWING_QUANT_BIT,
+                        false,
                     );
-                    let binary_msg = Message::Binary(postcard::to_allocvec(&msg).unwrap());
-                    let write = write.clone();
-                    tokio::spawn(async move {
-                        write.lock().await.send(binary_msg).await.unwrap();
-                    });
                 }
+                last_framebuffer_point = Some(end);
+
+                let current_point = GlobalCoordinates {
+                    x: position.x as f32 / chunk_size,
+                    y: position.y as f32 / chunk_size,
+                };
+                points.push(current_point);
             }
             _ => {
-                if let Some(last_path_id) = last_path_id {
+                last_framebuffer_point = None;
+                if points.len() > 0 {
+                    println!("Sending path with points ({})", points.len());
                     let msg = &blanke_ark_lib::message::Message::Draw(
-                        blanke_ark_lib::message::DrawMessage::PathStepAction(
-                            blanke_ark_lib::message::PathStepAction::End(PathStepEnd {
-                                id: last_path_id,
-                            }),
-                        ),
+                        blanke_ark_lib::message::DrawMessage::Path(blanke_ark_lib::message::Path {
+                            points: points.clone(),
+                            color: blanke_ark_lib::message::Color::RGB { r: 0, g: 0, b: 0 },
+                            width: blanke_ark_lib::message::Width::from(2.0 as f32),
+                        }),
                     );
                     let binary_msg = Message::Binary(postcard::to_allocvec(&msg).unwrap());
                     let write = write.clone();
@@ -240,7 +248,7 @@ async fn main_blanke_ark() {
                         write.lock().await.send(binary_msg).await.unwrap();
                     });
                 }
-                last_path_id = Some(PathId::from(ulid::Ulid::new()));
+                points = vec![];
             }
         },
         _ => {}
